@@ -104,7 +104,10 @@ async fn apply_service(ctx: &Context, ns: &str, dash: &RerunDashboard) -> Result
 async fn patch_status(ctx: &Context, ns: &str, dash: &RerunDashboard) -> Result<(), Error> {
     let name = dash.name_any();
     let dep_api: Api<Deployment> = Api::namespaced(ctx.client.clone(), ns);
-    let dep = dep_api.get_opt(&name).await?;
+    // Viewer Deployment is suffixed `-viewer`; see resources::deployment_name.
+    let dep = dep_api
+        .get_opt(&format!("{}-viewer", name))
+        .await?;
     let ready_replicas = dep
         .as_ref()
         .and_then(|d| d.status.as_ref())

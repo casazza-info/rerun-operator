@@ -72,8 +72,17 @@ pub fn build_configmap(dash: &RerunDashboard) -> Option<ConfigMap> {
     })
 }
 
+/// The viewer Deployment name. The CR name is reserved for the
+/// (dashboard-named) `Service`, which is what loggers connect to, and must
+/// not collide with unrelated Deployments a user may already run in the same
+/// namespace (e.g. a training pod sharing the CR name).
+fn deployment_name(dash: &RerunDashboard) -> String {
+    format!("{}-viewer", dash.name_any())
+}
+
 pub fn build_deployment(dash: &RerunDashboard) -> Deployment {
     let name = dash.name_any();
+    let dep_name = deployment_name(dash);
     let lbls = labels(&name);
     let rendered = render_launch(dash);
 
@@ -151,7 +160,7 @@ pub fn build_deployment(dash: &RerunDashboard) -> Deployment {
 
     Deployment {
         metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
-            name: Some(name.clone()),
+            name: Some(dep_name),
             namespace: dash.metadata.namespace.clone(),
             labels: Some(lbls.clone()),
             owner_references: Some(vec![owner_ref(dash)]),
