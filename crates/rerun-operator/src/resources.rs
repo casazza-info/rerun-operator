@@ -18,6 +18,11 @@ pub const MANAGER: &str = "rerun-operator";
 const BLUEPRINT_KEY: &str = "blueprint.py";
 const BLUEPRINT_MOUNT: &str = "/opt/rerun/blueprint";
 
+/// Browser WebSocket port served by the rerun CLI. Matches the constant
+/// in blueprint.rs so the Service and tunnel can reach it. Making this
+/// a const avoids a CRD change until someone actually needs to vary it.
+const BROWSER_WS_PORT: u16 = 9877;
+
 /// Default viewer image: vanilla Python; the container `pip install`s
 /// rerun-sdk on boot. A purpose-built image is left to a future release.
 const VIEWER_IMAGE: &str = "python:3.13-slim";
@@ -138,6 +143,12 @@ pub fn build_deployment(dash: &RerunDashboard) -> Deployment {
             protocol: Some("TCP".into()),
             ..Default::default()
         });
+        ports.push(ContainerPort {
+            name: Some("ws".into()),
+            container_port: BROWSER_WS_PORT as i32,
+            protocol: Some("TCP".into()),
+            ..Default::default()
+        });
     }
     if let Some(lp) = rendered.live_port {
         ports.push(ContainerPort {
@@ -204,6 +215,13 @@ pub fn build_service(dash: &RerunDashboard) -> Service {
             name: Some("web".into()),
             port: wp as i32,
             target_port: Some(IntOrString::Int(wp as i32)),
+            protocol: Some("TCP".into()),
+            ..Default::default()
+        });
+        ports.push(ServicePort {
+            name: Some("ws".into()),
+            port: BROWSER_WS_PORT as i32,
+            target_port: Some(IntOrString::Int(BROWSER_WS_PORT as i32)),
             protocol: Some("TCP".into()),
             ..Default::default()
         });
