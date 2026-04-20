@@ -218,10 +218,10 @@ fn render_run_fn(
             // 0.23+ API. `serve_grpc` opens the gRPC ingest port; the optional
             // `serve_web_viewer` serves the static HTML/JS bundle. Both are
             // called from the viewer process — the loggers connect over gRPC.
-            let mem = py_opt_str(memory_limit);
+            let mem = py_kwarg("server_memory_limit", memory_limit);
             writeln!(
                 out,
-                "    rr.serve_grpc(grpc_port={live_port}, server_memory_limit={mem})"
+                "    rr.serve_grpc(grpc_port={live_port}{mem})"
             )
             .unwrap();
             if let Some(wp) = web_port {
@@ -252,11 +252,11 @@ fn render_run_fn(
             // Legacy 0.22.x API. `serve_web` doubles as the WebSocket ingest
             // server (`ws_port`) and the static web bundle (`web_port`).
             let wp = web_port.unwrap_or(rerun_operator_api::v1alpha1::DEFAULT_WEB_PORT);
-            let mem = py_opt_str(memory_limit);
+            let mem = py_kwarg("server_memory_limit", memory_limit);
             writeln!(
                 out,
                 "    rr.serve_web(open_browser=False, web_port={wp}, ws_port={live_port}, \
-                 default_blueprint=bp, server_memory_limit={mem})"
+                 default_blueprint=bp{mem})"
             )
             .unwrap();
             writeln!(out, "    rr.send_blueprint(bp, make_active=True, make_default=True)")
@@ -354,6 +354,17 @@ fn py_opt_str(s: Option<&str>) -> String {
     match s {
         Some(s) => py_str(s),
         None => "None".to_string(),
+    }
+}
+
+/// Emit `, <key>=<py-repr>` when the value is set, else empty. Lets the
+/// rendered call omit optional keyword arguments rather than passing
+/// `<key>=None`, which some Rerun SDK bindings reject at the Python/Rust
+/// boundary (e.g. `server_memory_limit` expects a string or no argument).
+fn py_kwarg(key: &str, value: Option<&str>) -> String {
+    match value {
+        Some(v) => format!(", {key}={}", py_str(v)),
+        None => String::new(),
     }
 }
 
