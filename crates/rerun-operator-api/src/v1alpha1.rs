@@ -325,6 +325,7 @@ pub struct IngressConfig {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, JsonSchema, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub enum Visibility {
     /// Reachable only inside the cluster (ClusterIP Service).
     #[default]
