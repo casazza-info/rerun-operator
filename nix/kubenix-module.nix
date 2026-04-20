@@ -339,7 +339,10 @@ in
                   {
                     name = "rerun-operator";
                     image = cfg.image;
-                    imagePullPolicy = "IfNotPresent";
+                    # Always for the :latest tag during early development;
+                    # switch to IfNotPresent once the image is tagged by SHA
+                    # and the manifest pins an immutable reference.
+                    imagePullPolicy = "Always";
                     # The operator binary takes no subcommand to run the
                     # controller loop — only `export-crds` is a real
                     # subcommand. See crates/rerun-operator/src/main.rs.
