@@ -82,7 +82,7 @@ let
             {
               name = "Visibility";
               type = "string";
-              jsonPath = ".spec.ingress.visibility";
+              jsonPath = ".spec.presentation.ingress.visibility";
             }
             {
               name = "Age";
@@ -340,7 +340,9 @@ in
                     name = "rerun-operator";
                     image = cfg.image;
                     imagePullPolicy = "IfNotPresent";
-                    args = [ "run" ];
+                    # The operator binary takes no subcommand to run the
+                    # controller loop — only `export-crds` is a real
+                    # subcommand. See crates/rerun-operator/src/main.rs.
                     env = [
                       {
                         name = "RUST_LOG";
