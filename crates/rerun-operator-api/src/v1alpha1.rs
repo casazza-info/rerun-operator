@@ -3,15 +3,25 @@
 //! API group: rerun.nixlab.io, version v1alpha1.
 //!
 //! A RerunDashboard describes a long-lived Rerun web viewer plus its blueprint
-//! (view tree), ingest endpoint, optional PVC-backed .rrd persistence, and
-//! public exposure. Training jobs (e.g. SkyPilot tasks) attach by labeling
-//! their pod `rerun.nixlab.io/dashboard: <name>`; an admission webhook injects
+//! (view tree), data source, optional PVC-backed `.rrd` replay, and public
+//! exposure. Training jobs (e.g. SkyPilot tasks) attach by labeling their pod
+//! `rerun.nixlab.io/dashboard: <name>`; an admission webhook injects
 //! `RERUN_ENDPOINT` and `RERUN_APPLICATION_ID` env vars. The dashboard
 //! outlives any single logger.
 //!
-//! Scoped to Rerun SDK 0.22.x (connect_tcp / connect_grpc / serve_web).
+//! Wire protocol notes (post Rerun 0.23):
+//! - Rerun 0.23 (April 2025) removed the TCP/WebSocket wire transport.
+//!   The viewer now speaks gRPC-over-HTTP on the historical TCP port (9876).
+//! - `rr.connect_tcp()` is gone. The only logger API is
+//!   `rr.connect_grpc(url="rerun+http://host:9876/proxy")`.
+//! - The legacy 0.22.x WebSocket transport (port 9877) is still encodable in
+//!   this CRD via `WireTransport::WebSocket`, but is only valid against a
+//!   `rerunVersion` of `0.22.x`. The apiserver does not enforce this. The
+//!   reconciler currently falls back to the gRPC port for invalid combos
+//!   (see `resolve_live_port`) — a follow-up should also surface a
+//!   Degraded condition on the dashboard status.
 
-use k8s_openapi::api::core::v1::{PersistentVolumeClaimSpec, ResourceRequirements};
+use k8s_openapi::api::core::v1::ResourceRequirements;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::CustomResource;
 use schemars::JsonSchema;
@@ -34,12 +44,13 @@ use serde::{Deserialize, Serialize};
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
     printcolumn = r#"{"name":"Web","type":"string","jsonPath":".status.endpoints.web"}"#,
     printcolumn = r#"{"name":"Loggers","type":"integer","jsonPath":".status.connectedLoggers"}"#,
-    printcolumn = r#"{"name":"Visibility","type":"string","jsonPath":".spec.ingress.visibility"}"#,
+    printcolumn = r#"{"name":"Visibility","type":"string","jsonPath":".spec.presentation.ingress.visibility"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[serde(rename_all = "camelCase")]
 pub struct RerunDashboardSpec {
-    /// Rerun SDK version to pin the viewer image to (e.g. "0.22.1").
+    /// Rerun SDK version pinning the viewer image (e.g. "0.31.3"). The viewer
+    /// container `pip install`s `rerun-sdk==<version>` at startup.
     #[serde(default = "default_rerun_version")]
     pub rerun_version: String,
 
@@ -51,22 +62,12 @@ pub struct RerunDashboardSpec {
     /// Declarative blueprint: the view tree rendered in the viewer.
     pub blueprint: Blueprint,
 
-    /// How data flows from loggers into the viewer.
-    #[serde(default)]
-    pub ingest: IngestConfig,
+    /// Where the viewer's data comes from (live streams, file replay, or both).
+    pub data_source: DataSource,
 
-    /// Durability of streamed data.
+    /// How the viewer is exposed (web UI, ingress).
     #[serde(default)]
-    pub storage: StorageConfig,
-
-    /// How long to retain persisted recordings. Only applies when
-    /// `storage.mode = Persistent`. None = keep forever.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retention_seconds: Option<i64>,
-
-    /// Viewer exposure.
-    #[serde(default)]
-    pub ingress: IngressConfig,
+    pub presentation: Presentation,
 
     /// Resource requests/limits for the viewer pod.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -74,7 +75,7 @@ pub struct RerunDashboardSpec {
 }
 
 fn default_rerun_version() -> String {
-    "0.22.1".to_string()
+    "0.31.3".to_string()
 }
 
 // -----------------------------------------------------------------------------
@@ -103,8 +104,10 @@ pub struct Blueprint {
 fn preserve_unknown_fields(
     _gen: &mut schemars::r#gen::SchemaGenerator,
 ) -> schemars::schema::Schema {
-    let mut obj = schemars::schema::SchemaObject::default();
-    obj.instance_type = Some(schemars::schema::InstanceType::Object.into());
+    let mut obj = schemars::schema::SchemaObject {
+        instance_type: Some(schemars::schema::InstanceType::Object.into()),
+        ..Default::default()
+    };
     obj.extensions.insert(
         "x-kubernetes-preserve-unknown-fields".to_string(),
         serde_json::json!(true),
@@ -181,87 +184,124 @@ pub struct LeafView {
 }
 
 // -----------------------------------------------------------------------------
-// Ingest
+// DataSource
 // -----------------------------------------------------------------------------
 
+/// Where the viewer's data comes from. Replaces the 0.22-era `IngestConfig`,
+/// which conflated "loggers stream in" with "viewer is exposed".
 #[derive(Serialize, Deserialize, Debug, Clone, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct IngestConfig {
-    /// Transport the viewer accepts from loggers.
+pub struct DataSource {
+    /// `liveStream` (default): viewer accepts streaming data from loggers.
+    /// `fileReplay`: viewer loads `.rrd` files from a PVC at startup.
+    /// `mixed`: both.
     #[serde(default)]
-    pub protocol: IngestProtocol,
+    pub kind: DataSourceKind,
 
-    /// TCP/WebSocket ingest port (viewer listens here, loggers connect here).
-    /// Defaults to Rerun's upstream 9877 (`ws_port` in `serve_web`).
-    #[serde(default = "default_ingest_port")]
-    pub port: u16,
+    /// LiveStream / Mixed only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live: Option<LiveStreamConfig>,
 
-    /// Viewer HTTP port for the web UI. Defaults to Rerun's upstream 9090.
-    #[serde(default = "default_web_port")]
-    pub web_port: u16,
+    /// FileReplay / Mixed only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<FileReplayConfig>,
+}
 
-    /// Cap the viewer's in-memory ring buffer. Maps to `server_memory_limit`
-    /// (e.g. "25%", "2GiB"). Only meaningful when `storage.mode == Ephemeral`.
+#[derive(Serialize, Deserialize, Debug, Clone, JsonSchema, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum DataSourceKind {
+    #[default]
+    LiveStream,
+    FileReplay,
+    Mixed,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveStreamConfig {
+    /// Wire transport the viewer accepts from loggers. Defaults to `grpc`
+    /// (the only protocol Rerun 0.23+ supports).
+    #[serde(default)]
+    pub transport: WireTransport,
+
+    /// Port the viewer listens on for logger data. When unset, the reconciler
+    /// picks a version-aware default via `resolve_live_port()`:
+    /// - 0.22.x + WebSocket → 9877
+    /// - anything else → 9876 (gRPC)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+
+    /// Server-side memory cap (e.g. "25%", "2GiB"). Maps to the viewer's
+    /// `--server-memory-limit` CLI flag / `server_memory_limit` SDK arg.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_limit: Option<String>,
 }
 
-impl Default for IngestConfig {
+#[derive(Serialize, Deserialize, Debug, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FileReplayConfig {
+    /// Reference to a PVC holding `.rrd` (and optionally `.rbl`) files.
+    /// The PVC must be pre-provisioned — the operator does not synthesize one.
+    pub pvc: String,
+
+    /// Glob patterns (relative to the PVC mount) selecting files to replay.
+    /// Default when empty: `["*.rrd"]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub globs: Vec<String>,
+
+    /// Mount path inside the viewer pod. Default: `/var/lib/rerun/recordings`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount_path: Option<String>,
+
+    /// How long to retain `.rrd` files on the PVC, in seconds. Enforcement is
+    /// reconciler-side (out-of-band reaper). `None` = keep forever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_retention_seconds: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, JsonSchema, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum WireTransport {
+    /// 0.23+ gRPC-over-HTTP on port 9876. The only wire protocol Rerun
+    /// supports today. Logger URL form: `rerun+http://host:9876/proxy`.
+    #[default]
+    Grpc,
+    /// 0.22.x WebSocket ingest on port 9877. Legacy; valid only when
+    /// `spec.rerunVersion` is `0.22.x`. The apiserver does not enforce this.
+    /// The reconciler picks gRPC silently for invalid combos.
+    WebSocket,
+}
+
+// -----------------------------------------------------------------------------
+// Presentation
+// -----------------------------------------------------------------------------
+
+/// How the viewer is exposed to humans.
+#[derive(Serialize, Deserialize, Debug, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Presentation {
+    /// Host the web viewer. Default true.
+    #[serde(default = "default_true")]
+    pub web: bool,
+
+    /// Port the web UI is served on. `None` ⇒ reconciler uses 9090
+    /// (Rerun's default across all versions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_port: Option<u16>,
+
+    /// Ingress / Service exposure rules.
+    #[serde(default)]
+    pub ingress: IngressConfig,
+}
+
+impl Default for Presentation {
     fn default() -> Self {
         Self {
-            protocol: IngestProtocol::default(),
-            port: default_ingest_port(),
-            web_port: default_web_port(),
-            memory_limit: None,
+            web: true,
+            web_port: None,
+            ingress: IngressConfig::default(),
         }
     }
-}
-
-fn default_ingest_port() -> u16 {
-    9877
-}
-
-fn default_web_port() -> u16 {
-    9090
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, JsonSchema, Default, PartialEq)]
-pub enum IngestProtocol {
-    /// `rr.connect_tcp(addr)` in the logger. Matches the current sidecar
-    /// pattern where `serve_web`'s ws_port accepts streaming ingest.
-    #[default]
-    Tcp,
-    /// `rr.connect_grpc(addr)` in the logger.
-    Grpc,
-}
-
-// -----------------------------------------------------------------------------
-// Storage
-// -----------------------------------------------------------------------------
-
-#[derive(Serialize, Deserialize, Debug, Clone, JsonSchema, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct StorageConfig {
-    #[serde(default)]
-    pub mode: StorageMode,
-
-    /// Reuse an existing PVC. Mutually exclusive with `claimTemplate`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub existing_claim: Option<String>,
-
-    /// Provision a new PVC from this template (StatefulSet-style).
-    /// Mutually exclusive with `existingClaim`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub claim_template: Option<PersistentVolumeClaimSpec>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, JsonSchema, Default, PartialEq)]
-pub enum StorageMode {
-    /// Viewer ring buffer only; data lost on pod restart.
-    #[default]
-    Ephemeral,
-    /// Viewer also writes `.rrd` recordings to a PVC for later replay.
-    Persistent,
 }
 
 // -----------------------------------------------------------------------------
@@ -301,6 +341,40 @@ pub enum ServiceType {
 }
 
 // =============================================================================
+// Port resolution
+// =============================================================================
+
+/// Default web UI port. Rerun has used 9090 across all 0.x releases.
+pub const DEFAULT_WEB_PORT: u16 = 9090;
+
+/// Default gRPC live ingest port (0.23+).
+pub const DEFAULT_GRPC_PORT: u16 = 9876;
+
+/// Default WebSocket live ingest port (0.22.x legacy).
+pub const DEFAULT_WS_PORT: u16 = 9877;
+
+/// Resolve the live-stream ingest port given a Rerun version and transport.
+///
+/// Rules:
+/// - `0.22.x` + `WebSocket` → 9877 (ws_port in `serve_web`).
+/// - Anything else → 9876 (gRPC HTTP-2 on the historical TCP port).
+///
+/// Note: an invalid combination (e.g. `WebSocket` against `0.23.0`) is not
+/// flagged here — we silently pick the gRPC port, and the reconciler is
+/// responsible for surfacing a Degraded condition. This function is total.
+pub fn resolve_live_port(version: &str, transport: WireTransport) -> u16 {
+    if transport == WireTransport::WebSocket && is_022(version) {
+        DEFAULT_WS_PORT
+    } else {
+        DEFAULT_GRPC_PORT
+    }
+}
+
+fn is_022(version: &str) -> bool {
+    version == "0.22" || version.starts_with("0.22.")
+}
+
+// =============================================================================
 // Status
 // =============================================================================
 
@@ -322,7 +396,9 @@ pub struct RerunDashboardStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity_time: Option<String>,
 
-    /// Bytes of `.rrd` currently on the PVC (Persistent mode only).
+    /// Bytes of `.rrd` currently on the PVC. Always `None` for v1alpha1 — the
+    /// operator no longer synthesizes PVCs and does not measure them. Field
+    /// is kept for forward compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persisted_bytes: Option<u64>,
 
@@ -340,11 +416,11 @@ pub struct RerunDashboardStatus {
 #[derive(Serialize, Deserialize, Debug, Clone, JsonSchema, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Endpoints {
-    /// Web viewer URL, e.g. "http://rerun-foo.rerun.svc.cluster.local:9090/?url=ws://…".
+    /// Web viewer URL, e.g. `http://rerun-foo.rerun.svc.cluster.local:9090`.
     pub web: String,
-    /// Logger ingest URL, e.g. "tcp://rerun-foo.rerun.svc.cluster.local:9877"
-    /// or "grpc://…". Value is what the operator injects as `RERUN_ENDPOINT`
-    /// into attached pods.
+    /// Logger ingest URL. For gRPC: `rerun+http://host:9876/proxy`.
+    /// For legacy WebSocket: `ws://host:9877`. Value is what the operator
+    /// injects as `RERUN_ENDPOINT` into attached pods.
     pub ingest: String,
     /// Public URL if `visibility = Public`, else None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -394,7 +470,7 @@ mod tests {
 
     fn sample_spec() -> RerunDashboardSpec {
         RerunDashboardSpec {
-            rerun_version: "0.22.1".to_string(),
+            rerun_version: "0.31.3".to_string(),
             application_id: Some("spot_training".to_string()),
             blueprint: Blueprint {
                 collapse_panels: true,
@@ -426,18 +502,23 @@ mod tests {
                     name: None,
                 }),
             },
-            ingest: IngestConfig {
-                protocol: IngestProtocol::Tcp,
-                port: 9877,
-                web_port: 9090,
-                memory_limit: Some("25%".to_string()),
+            data_source: DataSource {
+                kind: DataSourceKind::LiveStream,
+                live: Some(LiveStreamConfig {
+                    transport: WireTransport::Grpc,
+                    port: None,
+                    memory_limit: Some("25%".to_string()),
+                }),
+                files: None,
             },
-            storage: StorageConfig::default(),
-            retention_seconds: None,
-            ingress: IngressConfig {
-                visibility: Visibility::Public,
-                service_type: ServiceType::ClusterIP,
-                public_hostname: Some("rerun.casazza.io".to_string()),
+            presentation: Presentation {
+                web: true,
+                web_port: None,
+                ingress: IngressConfig {
+                    visibility: Visibility::Public,
+                    service_type: ServiceType::ClusterIP,
+                    public_hostname: Some("rerun.casazza.io".to_string()),
+                },
             },
             resources: None,
         }
@@ -448,9 +529,13 @@ mod tests {
         let spec = sample_spec();
         let s = serde_json::to_string(&spec).unwrap();
         let back: RerunDashboardSpec = serde_json::from_str(&s).unwrap();
-        assert_eq!(back.rerun_version, "0.22.1");
-        assert_eq!(back.ingest.port, 9877);
-        assert_eq!(back.ingress.visibility, Visibility::Public);
+        assert_eq!(back.rerun_version, "0.31.3");
+        assert_eq!(back.data_source.kind, DataSourceKind::LiveStream);
+        assert_eq!(
+            back.data_source.live.as_ref().unwrap().transport,
+            WireTransport::Grpc
+        );
+        assert_eq!(back.presentation.ingress.visibility, Visibility::Public);
         assert_eq!(back.application_id.as_deref(), Some("spot_training"));
     }
 
@@ -460,11 +545,17 @@ mod tests {
         let v: Value = serde_json::to_value(&spec).unwrap();
         assert!(v.get("rerunVersion").is_some());
         assert!(v.get("applicationId").is_some());
-        assert!(v.get("retentionSeconds").is_none());
-        let ingest = v.get("ingest").unwrap();
-        assert!(ingest.get("webPort").is_some());
-        assert!(ingest.get("memoryLimit").is_some());
-        let ingress = v.get("ingress").unwrap();
+        assert!(v.get("dataSource").is_some());
+        assert!(v.get("presentation").is_some());
+
+        let ds = v.get("dataSource").unwrap();
+        assert_eq!(ds.get("kind").and_then(Value::as_str), Some("liveStream"));
+        let live = ds.get("live").unwrap();
+        assert_eq!(live.get("transport").and_then(Value::as_str), Some("grpc"));
+        assert!(live.get("memoryLimit").is_some());
+
+        let pres = v.get("presentation").unwrap();
+        let ingress = pres.get("ingress").unwrap();
         assert!(ingress.get("publicHostname").is_some());
         assert!(ingress.get("serviceType").is_some());
     }
@@ -486,15 +577,17 @@ mod tests {
         let j = json!({
             "blueprint": {
                 "root": { "kind": "timeSeries", "origin": "/metrics" }
-            }
+            },
+            "dataSource": { "kind": "liveStream" }
         });
         let spec: RerunDashboardSpec = serde_json::from_value(j).unwrap();
-        assert_eq!(spec.rerun_version, "0.22.1");
-        assert_eq!(spec.ingest.port, 9877);
-        assert_eq!(spec.ingest.web_port, 9090);
-        assert_eq!(spec.ingest.protocol, IngestProtocol::Tcp);
-        assert_eq!(spec.storage.mode, StorageMode::Ephemeral);
-        assert_eq!(spec.ingress.visibility, Visibility::Cluster);
+        assert_eq!(spec.rerun_version, "0.31.3");
+        assert_eq!(spec.data_source.kind, DataSourceKind::LiveStream);
+        assert!(spec.data_source.live.is_none());
+        assert!(spec.data_source.files.is_none());
+        assert!(spec.presentation.web);
+        assert!(spec.presentation.web_port.is_none());
+        assert_eq!(spec.presentation.ingress.visibility, Visibility::Cluster);
         assert!(spec.blueprint.collapse_panels);
         match spec.blueprint.root {
             View::TimeSeries(v) => assert_eq!(v.origin, "/metrics"),
@@ -503,10 +596,69 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_file_replay_spec() {
+        let j = json!({
+            "blueprint": {
+                "root": { "kind": "spatial3D", "origin": "/" }
+            },
+            "dataSource": {
+                "kind": "fileReplay",
+                "files": {
+                    "pvc": "training-recordings",
+                    "globs": ["session-*.rrd", "*.rbl"],
+                    "mountPath": "/data/rrds",
+                    "fileRetentionSeconds": 604800
+                }
+            }
+        });
+        let spec: RerunDashboardSpec = serde_json::from_value(j).unwrap();
+        assert_eq!(spec.data_source.kind, DataSourceKind::FileReplay);
+        let files = spec.data_source.files.as_ref().expect("files set");
+        assert_eq!(files.pvc, "training-recordings");
+        assert_eq!(files.globs, vec!["session-*.rrd", "*.rbl"]);
+        assert_eq!(files.mount_path.as_deref(), Some("/data/rrds"));
+        assert_eq!(files.file_retention_seconds, Some(604800));
+
+        // Roundtrip the FileReplay shape.
+        let s = serde_json::to_string(&spec).unwrap();
+        let back: RerunDashboardSpec = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.data_source.kind, DataSourceKind::FileReplay);
+        let v: Value = serde_json::to_value(&back).unwrap();
+        let ds = v.get("dataSource").unwrap();
+        assert_eq!(ds.get("kind").and_then(Value::as_str), Some("fileReplay"));
+        let files = ds.get("files").unwrap();
+        assert_eq!(files.get("pvc").and_then(Value::as_str), Some("training-recordings"));
+        assert!(files.get("mountPath").is_some());
+        assert!(files.get("fileRetentionSeconds").is_some());
+    }
+
+    #[test]
+    fn deserialize_mixed_spec() {
+        let j = json!({
+            "blueprint": {
+                "root": { "kind": "spatial3D", "origin": "/" }
+            },
+            "dataSource": {
+                "kind": "mixed",
+                "live": { "transport": "grpc" },
+                "files": { "pvc": "rrds" }
+            }
+        });
+        let spec: RerunDashboardSpec = serde_json::from_value(j).unwrap();
+        assert_eq!(spec.data_source.kind, DataSourceKind::Mixed);
+        assert!(spec.data_source.live.is_some());
+        assert!(spec.data_source.files.is_some());
+
+        let v: Value = serde_json::to_value(&spec).unwrap();
+        let ds = v.get("dataSource").unwrap();
+        assert_eq!(ds.get("kind").and_then(Value::as_str), Some("mixed"));
+    }
+
+    #[test]
     fn default_values() {
         assert_eq!(DashboardPhase::default(), DashboardPhase::Pending);
-        assert_eq!(IngestProtocol::default(), IngestProtocol::Tcp);
-        assert_eq!(StorageMode::default(), StorageMode::Ephemeral);
+        assert_eq!(WireTransport::default(), WireTransport::Grpc);
+        assert_eq!(DataSourceKind::default(), DataSourceKind::LiveStream);
         assert_eq!(Visibility::default(), Visibility::Cluster);
         assert_eq!(ServiceType::default(), ServiceType::ClusterIP);
         let status = RerunDashboardStatus::default();
@@ -514,6 +666,55 @@ mod tests {
         assert_eq!(status.connected_loggers, 0);
         assert!(status.endpoints.is_none());
         assert!(status.conditions.is_empty());
+        assert!(status.persisted_bytes.is_none());
+    }
+
+    #[test]
+    fn resolve_live_port_versions() {
+        // 0.22.x WebSocket → 9877
+        assert_eq!(
+            resolve_live_port("0.22.0", WireTransport::WebSocket),
+            DEFAULT_WS_PORT
+        );
+        assert_eq!(
+            resolve_live_port("0.22.1", WireTransport::WebSocket),
+            DEFAULT_WS_PORT
+        );
+        assert_eq!(
+            resolve_live_port("0.22", WireTransport::WebSocket),
+            DEFAULT_WS_PORT
+        );
+
+        // 0.22.x gRPC → 9876 (still gRPC)
+        assert_eq!(
+            resolve_live_port("0.22.1", WireTransport::Grpc),
+            DEFAULT_GRPC_PORT
+        );
+
+        // 0.23+ → 9876 regardless of transport (WebSocket invalid; reconciler
+        // surfaces the error, this fn is total).
+        assert_eq!(
+            resolve_live_port("0.23.0", WireTransport::Grpc),
+            DEFAULT_GRPC_PORT
+        );
+        assert_eq!(
+            resolve_live_port("0.23.0", WireTransport::WebSocket),
+            DEFAULT_GRPC_PORT
+        );
+        assert_eq!(
+            resolve_live_port("0.31.3", WireTransport::Grpc),
+            DEFAULT_GRPC_PORT
+        );
+        assert_eq!(
+            resolve_live_port("0.23.0-rc.1", WireTransport::WebSocket),
+            DEFAULT_GRPC_PORT
+        );
+
+        // Spurious version that merely contains "0.22" should not match.
+        assert_eq!(
+            resolve_live_port("0.220.0", WireTransport::WebSocket),
+            DEFAULT_GRPC_PORT
+        );
     }
 
     #[test]

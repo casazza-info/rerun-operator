@@ -4,24 +4,22 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
 use k8s_openapi::api::core::v1::{
-    ConfigMap, ConfigMapVolumeSource, Container, ContainerPort, PersistentVolumeClaim,
-    PersistentVolumeClaimVolumeSource, PodSpec, PodTemplateSpec, Service, ServicePort, ServiceSpec,
-    Volume, VolumeMount,
+    ConfigMap, ConfigMapVolumeSource, Container, ContainerPort, PersistentVolumeClaimVolumeSource,
+    PodSpec, PodTemplateSpec, Service, ServicePort, ServiceSpec, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReference};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::ResourceExt;
-use rerun_operator_api::v1alpha1::{RerunDashboard, StorageMode};
+use rerun_operator_api::v1alpha1::{DataSourceKind, RerunDashboard};
 
-use crate::blueprint;
+use crate::blueprint::{self, DEFAULT_REPLAY_MOUNT, RenderedLaunch};
 
 pub const MANAGER: &str = "rerun-operator";
 const BLUEPRINT_KEY: &str = "blueprint.py";
 const BLUEPRINT_MOUNT: &str = "/opt/rerun/blueprint";
-const CHECKPOINT_MOUNT: &str = "/var/lib/rerun";
 
-/// Default viewer image: python:3.13-slim with rerun-sdk installed at start.
-/// A future release should ship a purpose-built image.
+/// Default viewer image: vanilla Python; the container `pip install`s
+/// rerun-sdk on boot. A purpose-built image is left to a future release.
 const VIEWER_IMAGE: &str = "python:3.13-slim";
 
 pub fn labels(dashboard_name: &str) -> BTreeMap<String, String> {
@@ -29,10 +27,7 @@ pub fn labels(dashboard_name: &str) -> BTreeMap<String, String> {
         ("app.kubernetes.io/name".into(), "rerun-dashboard".into()),
         ("app.kubernetes.io/instance".into(), dashboard_name.into()),
         ("app.kubernetes.io/managed-by".into(), MANAGER.into()),
-        (
-            "rerun.nixlab.io/dashboard".into(),
-            dashboard_name.into(),
-        ),
+        ("rerun.nixlab.io/dashboard".into(), dashboard_name.into()),
     ])
 }
 
@@ -47,16 +42,24 @@ fn owner_ref(dash: &RerunDashboard) -> OwnerReference {
     }
 }
 
-pub fn build_configmap(dash: &RerunDashboard) -> ConfigMap {
+fn render_launch(dash: &RerunDashboard) -> RenderedLaunch {
     let name = dash.name_any();
     let app_id = dash
         .spec
         .application_id
         .clone()
         .unwrap_or_else(|| name.clone());
-    let rendered = blueprint::render(&app_id, &dash.spec);
+    blueprint::render(&app_id, &dash.spec)
+}
 
-    ConfigMap {
+/// Build the blueprint ConfigMap. Returns `None` for FileReplay (no Python
+/// module needed).
+pub fn build_configmap(dash: &RerunDashboard) -> Option<ConfigMap> {
+    let name = dash.name_any();
+    let rendered = render_launch(dash);
+    let python = rendered.python?;
+
+    Some(ConfigMap {
         metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
             name: Some(format!("{name}-blueprint")),
             namespace: dash.metadata.namespace.clone(),
@@ -64,57 +67,74 @@ pub fn build_configmap(dash: &RerunDashboard) -> ConfigMap {
             owner_references: Some(vec![owner_ref(dash)]),
             ..Default::default()
         },
-        data: Some(BTreeMap::from([(BLUEPRINT_KEY.into(), rendered.python)])),
+        data: Some(BTreeMap::from([(BLUEPRINT_KEY.into(), python)])),
         ..Default::default()
-    }
+    })
 }
 
 pub fn build_deployment(dash: &RerunDashboard) -> Deployment {
     let name = dash.name_any();
     let lbls = labels(&name);
-    let ingest = &dash.spec.ingest;
-    let version = &dash.spec.rerun_version;
+    let rendered = render_launch(dash);
 
-    let install_cmd = format!(
-        "pip install --no-cache-dir --quiet 'rerun-sdk=={version}' && \
-         exec python -u {mount}/{key}",
-        mount = BLUEPRINT_MOUNT,
-        key = BLUEPRINT_KEY,
-    );
+    let mut volumes: Vec<Volume> = Vec::new();
+    let mut mounts: Vec<VolumeMount> = Vec::new();
 
-    let mut volumes = vec![Volume {
-        name: "blueprint".into(),
-        config_map: Some(ConfigMapVolumeSource {
-            name: format!("{name}-blueprint"),
+    if rendered.python.is_some() {
+        volumes.push(Volume {
+            name: "blueprint".into(),
+            config_map: Some(ConfigMapVolumeSource {
+                name: format!("{name}-blueprint"),
+                ..Default::default()
+            }),
             ..Default::default()
-        }),
-        ..Default::default()
-    }];
-    let mut mounts = vec![VolumeMount {
-        name: "blueprint".into(),
-        mount_path: BLUEPRINT_MOUNT.into(),
-        read_only: Some(true),
-        ..Default::default()
-    }];
+        });
+        mounts.push(VolumeMount {
+            name: "blueprint".into(),
+            mount_path: BLUEPRINT_MOUNT.into(),
+            read_only: Some(true),
+            ..Default::default()
+        });
+    }
 
-    if dash.spec.storage.mode == StorageMode::Persistent {
-        let claim_name = dash
-            .spec
-            .storage
-            .existing_claim
-            .clone()
-            .unwrap_or_else(|| format!("{name}-checkpoints"));
+    // FileReplay (or Mixed with explicit files): mount the user-provided PVC.
+    if matches!(
+        dash.spec.data_source.kind,
+        DataSourceKind::FileReplay | DataSourceKind::Mixed
+    ) && let Some(files) = &dash.spec.data_source.files
+    {
         volumes.push(Volume {
             name: "recordings".into(),
             persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
-                claim_name,
+                claim_name: files.pvc.clone(),
                 read_only: Some(false),
             }),
             ..Default::default()
         });
         mounts.push(VolumeMount {
             name: "recordings".into(),
-            mount_path: CHECKPOINT_MOUNT.into(),
+            mount_path: files
+                .mount_path
+                .clone()
+                .unwrap_or_else(|| DEFAULT_REPLAY_MOUNT.to_string()),
+            ..Default::default()
+        });
+    }
+
+    let mut ports: Vec<ContainerPort> = Vec::new();
+    if let Some(wp) = rendered.web_port {
+        ports.push(ContainerPort {
+            name: Some("web".into()),
+            container_port: wp as i32,
+            protocol: Some("TCP".into()),
+            ..Default::default()
+        });
+    }
+    if let Some(lp) = rendered.live_port {
+        ports.push(ContainerPort {
+            name: Some("ingest".into()),
+            container_port: lp as i32,
+            protocol: Some("TCP".into()),
             ..Default::default()
         });
     }
@@ -122,22 +142,9 @@ pub fn build_deployment(dash: &RerunDashboard) -> Deployment {
     let container = Container {
         name: "viewer".into(),
         image: Some(VIEWER_IMAGE.into()),
-        command: Some(vec!["sh".into(), "-c".into(), install_cmd]),
-        ports: Some(vec![
-            ContainerPort {
-                name: Some("web".into()),
-                container_port: ingest.web_port as i32,
-                protocol: Some("TCP".into()),
-                ..Default::default()
-            },
-            ContainerPort {
-                name: Some("ingest".into()),
-                container_port: ingest.port as i32,
-                protocol: Some("TCP".into()),
-                ..Default::default()
-            },
-        ]),
-        volume_mounts: Some(mounts),
+        command: Some(vec!["sh".into(), "-c".into(), rendered.shell]),
+        ports: if ports.is_empty() { None } else { Some(ports) },
+        volume_mounts: if mounts.is_empty() { None } else { Some(mounts) },
         resources: dash.spec.resources.clone(),
         ..Default::default()
     };
@@ -167,7 +174,7 @@ pub fn build_deployment(dash: &RerunDashboard) -> Deployment {
                 }),
                 spec: Some(PodSpec {
                     containers: vec![container],
-                    volumes: Some(volumes),
+                    volumes: if volumes.is_empty() { None } else { Some(volumes) },
                     ..Default::default()
                 }),
             },
@@ -180,7 +187,27 @@ pub fn build_deployment(dash: &RerunDashboard) -> Deployment {
 pub fn build_service(dash: &RerunDashboard) -> Service {
     let name = dash.name_any();
     let lbls = labels(&name);
-    let ingest = &dash.spec.ingest;
+    let rendered = render_launch(dash);
+
+    let mut ports: Vec<ServicePort> = Vec::new();
+    if let Some(wp) = rendered.web_port {
+        ports.push(ServicePort {
+            name: Some("web".into()),
+            port: wp as i32,
+            target_port: Some(IntOrString::Int(wp as i32)),
+            protocol: Some("TCP".into()),
+            ..Default::default()
+        });
+    }
+    if let Some(lp) = rendered.live_port {
+        ports.push(ServicePort {
+            name: Some("ingest".into()),
+            port: lp as i32,
+            target_port: Some(IntOrString::Int(lp as i32)),
+            protocol: Some("TCP".into()),
+            ..Default::default()
+        });
+    }
 
     Service {
         metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
@@ -193,44 +220,11 @@ pub fn build_service(dash: &RerunDashboard) -> Service {
         spec: Some(ServiceSpec {
             type_: Some("ClusterIP".into()),
             selector: Some(lbls),
-            ports: Some(vec![
-                ServicePort {
-                    name: Some("web".into()),
-                    port: ingest.web_port as i32,
-                    target_port: Some(IntOrString::Int(ingest.web_port as i32)),
-                    protocol: Some("TCP".into()),
-                    ..Default::default()
-                },
-                ServicePort {
-                    name: Some("ingest".into()),
-                    port: ingest.port as i32,
-                    target_port: Some(IntOrString::Int(ingest.port as i32)),
-                    protocol: Some("TCP".into()),
-                    ..Default::default()
-                },
-            ]),
+            ports: if ports.is_empty() { None } else { Some(ports) },
             ..Default::default()
         }),
         ..Default::default()
     }
-}
-
-/// Build a PVC from a claimTemplate. Only called when storage.mode = Persistent
-/// AND spec.storage.claim_template is set AND existing_claim is None.
-pub fn build_pvc(dash: &RerunDashboard) -> Option<PersistentVolumeClaim> {
-    let template = dash.spec.storage.claim_template.as_ref()?;
-    let name = dash.name_any();
-    Some(PersistentVolumeClaim {
-        metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
-            name: Some(format!("{name}-checkpoints")),
-            namespace: dash.metadata.namespace.clone(),
-            labels: Some(labels(&name)),
-            owner_references: Some(vec![owner_ref(dash)]),
-            ..Default::default()
-        },
-        spec: Some(template.clone()),
-        ..Default::default()
-    })
 }
 
 /// Compute the in-cluster DNS hostname of the viewer service.
