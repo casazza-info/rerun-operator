@@ -1,0 +1,30 @@
+[package]
+name = "rerun-operator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Kubernetes operator reconciling RerunDashboard CRs"
+
+[[bin]]
+name = "rerun-operator"
+path = "src/main.rs"
+
+[dependencies]
+rerun-operator-api = { workspace = true }
+hephaestus-operator-lib = { workspace = true }
+
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+futures = { workspace = true }
+anyhow = { workspace = true }
+prometheus = { workspace = true }
+once_cell = { workspace = true }
+chrono = { workspace = true }
