@@ -15,9 +15,7 @@ repository = "https://github.com/casazza-info/rerun-operator"
 rerun-operator-api = { path = "crates/rerun-operator-api" }
 
 # Shared scaffolding from the hephaestus workspace.
-# Flip to a git ref after hephaestus-operator-lib is published to main:
-#   hephaestus-operator-lib = { git = "https://github.com/casazza-info/hephaestus", branch = "main" }
-hephaestus-operator-lib = { path = "../hephaestus/crates/hephaestus-operator-lib" }
+hephaestus-operator-lib = { git = "https://github.com/casazza-info/hephaestus", branch = "main" }
 
 kube = { version = "0.98", features = ["runtime", "derive", "client"] }
 k8s-openapi = { version = "0.24", features = ["v1_32", "schemars"] }
