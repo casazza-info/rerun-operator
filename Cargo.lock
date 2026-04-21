@@ -609,7 +609,7 @@ dependencies = [
 [[package]]
 name = "hephaestus-operator-lib"
 version = "0.1.0"
-source = "git+https://github.com/casazza-info/hephaestus?branch=main#06c730a0ed345dd1967911ece7ef84d214784b96"
+source = "git+https://github.com/casazza-info/hephaestus?branch=main#e2868ee84f2d4f491edf1adbdbd163f4e6c83d1a"
 dependencies = [
  "anyhow",
  "axum",
