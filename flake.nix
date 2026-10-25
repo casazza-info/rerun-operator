@@ -86,6 +86,10 @@
         }
       );
 
+      # The x86_64-linux Buildbot gate builds the same operator derivation
+      # exposed as the package; no synthetic test derivation is introduced.
+      checks.x86_64-linux.default = packages.x86_64-linux.rerun-operator;
+
       devShells = forAllSystems (
         system:
         let

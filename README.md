@@ -62,6 +62,13 @@ cargo test -p rerun-operator-api
 cargo build -p rerun-operator
 ```
 
+## Nix CI
+
+The flake's `checks.x86_64-linux.default` builds the same
+`packages.x86_64-linux.rerun-operator` derivation used for the operator image.
+It is the meaningful Buildbot gate for the supported Linux builder; the other
+declared package systems remain available for their native builders.
+
 ## Related
 
 Shares telemetry and CLI scaffolding with
