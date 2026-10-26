@@ -62,6 +62,24 @@ cargo test -p rerun-operator-api
 cargo build -p rerun-operator
 ```
 
+## Nix CI and Hydra
+
+The flake's `checks.x86_64-linux.default` and
+`hydraJobs.x86_64-linux.rerun-operator` reuse the same
+`packages.x86_64-linux.rerun-operator` derivation. Buildbot gates the
+supported Linux package; Hydra is the canonical artifact producer when its
+service is healthy. The other declared package systems remain available for
+their native builders.
+
+The private shared library is pinned as a flake source and patched into the
+generated Cargo source only for Nix evaluation. This uses the existing
+Buildbot App credential path, avoids unauthenticated Cargo git fetches, and
+does not store credentials or change the package API. The generated Nix
+source derives the expected Cargo revision from the resolved pinned
+`hephaestus` input itself; the source step fails closed if the selected Cargo
+revision is missing or duplicated. To bump it, update the Cargo.lock git
+revision and the matching pinned flake.lock input together.
+
 ## Related
 
 Shares telemetry and CLI scaffolding with
