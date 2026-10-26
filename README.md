@@ -71,6 +71,11 @@ supported Linux package; Hydra is the canonical artifact producer when its
 service is healthy. The other declared package systems remain available for
 their native builders.
 
+The private shared library is pinned as a flake source and patched into the
+generated Cargo source only for Nix evaluation. This uses the existing
+Buildbot App credential path, avoids unauthenticated Cargo git fetches, and
+does not store credentials or change the package API.
+
 ## Related
 
 Shares telemetry and CLI scaffolding with

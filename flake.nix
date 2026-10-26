@@ -8,6 +8,13 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # Cargo cannot authenticate private git dependencies during Nix evaluation.
+    # Fetch the shared source through the authenticated GitHub flake fetcher,
+    # then patch the generated Cargo source to use this pinned tree.
+    hephaestus = {
+      url = "github:casazza-info/hephaestus/e2868ee84f2d4f491edf1adbdbd163f4e6c83d1a";
+      flake = false;
+    };
   };
 
   outputs =
@@ -16,6 +23,7 @@
       nixpkgs,
       crane,
       rust-overlay,
+      hephaestus,
     }:
     let
       supportedSystems = [
@@ -45,7 +53,20 @@
           };
           craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-          src = craneLib.cleanCargoSource ./.;
+          cleanSrc = craneLib.cleanCargoSource ./.;
+          src = pkgs.runCommand "rerun-operator-source" { } ''
+            mkdir -p "$out"
+            cp -R ${cleanSrc}/. "$out/"
+            chmod -R u+w "$out"
+            mkdir -p "$out/vendor/hephaestus"
+            cp -R ${hephaestus}/. "$out/vendor/hephaestus/"
+            cat >> "$out/Cargo.toml" <<'EOF'
+
+            [patch."https://github.com/casazza-info/hephaestus"]
+            hephaestus-operator-lib = { path = "vendor/hephaestus/crates/hephaestus-operator-lib" }
+            EOF
+            sed -i '/^source = "git+https:\/\/github.com\/casazza-info\/hephaestus?branch=main#/d' "$out/Cargo.lock"
+          '';
 
           commonArgs = {
             inherit src;

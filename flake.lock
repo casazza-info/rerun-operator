@@ -15,6 +15,23 @@
         "type": "github"
       }
     },
+    "hephaestus": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1776673526,
+        "narHash": "sha256-jbGAwGWOfopQ/SBYA1ydE9rOjAbLLHwkOmgivPNHx/M=",
+        "owner": "casazza-info",
+        "repo": "hephaestus",
+        "rev": "e2868ee84f2d4f491edf1adbdbd163f4e6c83d1a",
+        "type": "github"
+      },
+      "original": {
+        "owner": "casazza-info",
+        "repo": "hephaestus",
+        "rev": "e2868ee84f2d4f491edf1adbdbd163f4e6c83d1a",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1776169885,
@@ -34,6 +51,7 @@
     "root": {
       "inputs": {
         "crane": "crane",
+        "hephaestus": "hephaestus",
         "nixpkgs": "nixpkgs",
         "rust-overlay": "rust-overlay"
       }
