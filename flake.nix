@@ -26,7 +26,7 @@
       hephaestus,
     }:
     let
-      expectedHephaestusRev = "e2868ee84f2d4f491edf1adbdbd163f4e6c83d1a";
+      expectedHephaestusRev = hephaestus.rev;
       supportedSystems = [
         "x86_64-linux"
         "aarch64-linux"
