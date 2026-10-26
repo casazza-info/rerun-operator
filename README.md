@@ -74,7 +74,10 @@ their native builders.
 The private shared library is pinned as a flake source and patched into the
 generated Cargo source only for Nix evaluation. This uses the existing
 Buildbot App credential path, avoids unauthenticated Cargo git fetches, and
-does not store credentials or change the package API.
+does not store credentials or change the package API. To bump it, update the
+`Cargo.lock` git revision, the `expectedHephaestusRev` assertion, and the
+matching pinned `flake.lock` input together; the Nix source step fails closed
+if the selected Cargo revision is missing or duplicated.
 
 ## Related
 

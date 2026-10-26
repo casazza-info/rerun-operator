@@ -26,6 +26,7 @@
       hephaestus,
     }:
     let
+      expectedHephaestusRev = "e2868ee84f2d4f491edf1adbdbd163f4e6c83d1a";
       supportedSystems = [
         "x86_64-linux"
         "aarch64-linux"
@@ -60,12 +61,20 @@
             chmod -R u+w "$out"
             mkdir -p "$out/vendor/hephaestus"
             cp -R ${hephaestus}/. "$out/vendor/hephaestus/"
+            expected_source='git+https://github.com/casazza-info/hephaestus?branch=main#${expectedHephaestusRev}'
+            test "$(grep -Fc 'name = "hephaestus-operator-lib"' "$out/Cargo.lock")" -eq 1
+            test "$(grep -Fxc "source = \"$expected_source\"" "$out/Cargo.lock")" -eq 1
             cat >> "$out/Cargo.toml" <<'EOF'
 
             [patch."https://github.com/casazza-info/hephaestus"]
             hephaestus-operator-lib = { path = "vendor/hephaestus/crates/hephaestus-operator-lib" }
             EOF
-            sed -i '/^source = "git+https:\/\/github.com\/casazza-info\/hephaestus?branch=main#/d' "$out/Cargo.lock"
+            grep -Fv "source = \"$expected_source\"" "$out/Cargo.lock" > "$out/Cargo.lock.tmp"
+            mv "$out/Cargo.lock.tmp" "$out/Cargo.lock"
+            if grep -Fq 'source = "git+https://github.com/casazza-info/hephaestus' "$out/Cargo.lock"; then
+              echo "unexpected hephaestus git source after pinned patch" >&2
+              exit 1
+            fi
           '';
 
           commonArgs = {
