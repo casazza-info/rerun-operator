@@ -88,7 +88,11 @@
 
       # The x86_64-linux Buildbot gate builds the same operator derivation
       # exposed as the package; no synthetic test derivation is introduced.
-      checks.x86_64-linux.default = packages.x86_64-linux.rerun-operator;
+      checks.x86_64-linux.default = self.packages.x86_64-linux.rerun-operator;
+
+      # Hydra's x86 artifact reuses the operator package derivation; package
+      # outputs for the other declared systems remain unchanged.
+      hydraJobs.x86_64-linux.rerun-operator = self.packages.x86_64-linux.rerun-operator;
 
       devShells = forAllSystems (
         system:

@@ -62,12 +62,14 @@ cargo test -p rerun-operator-api
 cargo build -p rerun-operator
 ```
 
-## Nix CI
+## Nix CI and Hydra
 
-The flake's `checks.x86_64-linux.default` builds the same
-`packages.x86_64-linux.rerun-operator` derivation used for the operator image.
-It is the meaningful Buildbot gate for the supported Linux builder; the other
-declared package systems remain available for their native builders.
+The flake's `checks.x86_64-linux.default` and
+`hydraJobs.x86_64-linux.rerun-operator` reuse the same
+`packages.x86_64-linux.rerun-operator` derivation. Buildbot gates the
+supported Linux package; Hydra is the canonical artifact producer when its
+service is healthy. The other declared package systems remain available for
+their native builders.
 
 ## Related
 
